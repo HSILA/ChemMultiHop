@@ -1,0 +1,8 @@
+pandas
+tqdm 
+openai
+python-dotenv
+pydantic
+langchain-aws
+boto3
+ollama
