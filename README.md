@@ -3,6 +3,7 @@ ChemMultiHopBench is a repository that accompanies our study on multi-hop reason
 
 ## Repository Contents
 
+- **Graph**: The constructed graph from extracted entities and generated relations which is used for multi-hop question generation.
 - **Q&A Data:** A collection of multi-hop chemistry questions and answers with the context required to answer them.
 - **HotpotQA Data:** A chemistry-specific subset of the HotpotQA dataset consisting of questions, answers and context.
 - **Evaluation Code:** Script used to assess model performance and reproduce evaluation results presented in the paper.
@@ -32,3 +33,5 @@ ChemMultiHopBench is a repository that accompanies our study on multi-hop reason
 The code takes `ChemMultiHopBench.json`, which contains a collection of questions, answers, context, and lengths (hops), evaluates all the models on it with and without context, saves the model-specific results in the `responses` directory, and creates a `results.csv` file with the overall performance and usage details of the models.
 
 Additionally, the repository consists of `HotpotQA-Chemistry.json`, which is a subset of the HotpotQA dataset that was used to evaluate the models on the chemistry-specific multi-hop reasoning task. The format of this file is compatible with the `evaluate.py` script. We sampled chemistry questions by starting from Wikipedia’s Chemistry category, recursively exploring its subcategories (up to three levels), and then filtering HotpotQA based on exact title matches. To maintain consistency with our evaluation scheme, we excluded distractors and included only supporting documents as context.
+
+The question and answers are generated from the `Graph.json`, which contains the constructed graph with keys `nodes` and `edges` that represent the entities and relations, respectively.
