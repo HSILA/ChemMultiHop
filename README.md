@@ -9,6 +9,15 @@ ChemMultiHopBench is a repository that accompanies our study on multi-hop reason
 - **Evaluation Code:** Script used to assess model performance and reproduce evaluation results presented in the paper.
 - **Model Responses:** The outputs from various models evaluated under different conditions (contextual and non-contextual) as reported in the study.
 - **HotpotQA Responses:** The outputs from various models evaluated on the HotpotQA dataset under different conditions (contextual and non-contextual) as reported in the study.
+- **Kept/Removed Data:**  
+  - `kept_data.json`: All multi-hop items with at least one correct model response.  
+  - `removed_data.json`: All multi-hop items where `number_of_corrects` is zero (i.e., no model got them right).  
+  Both files include:
+    - `q`: question text  
+    - `a`: expected answer  
+    - `path`: list of `{entity1, relation, entity2, text, meta1, q, a}` objects showing exactly which graph edges and evidence snippets were used to generate this question  
+    - `number_of_corrects`: total times any model answered correctly (contextual + non-contextual)
+
 
 ## How to Run The Evaluation
 
