@@ -17,7 +17,8 @@ ChemMultiHopBench is a repository that accompanies our study on multi-hop reason
     - `a`: expected answer  
     - `path`: list of `{entity1, relation, entity2, text, meta1, q, a}` objects showing exactly which graph edges and evidence snippets were used to generate this question  
     - `number_of_corrects`: total times any model answered correctly (contextual + non-contextual)
-
+- **Experts Feedback:** The feedback from experts on the quality of the questions, dividing the generated questions in 3 groups, Poor, Ok, and Good.
+- **Appendix:** A comprehensive explanation of each part of the pipeline (Both Graph Generation and QA Generation), including algorithms, modules, and prompts, added in the appendix of the paper.
 
 ## How to Run The Evaluation
 
