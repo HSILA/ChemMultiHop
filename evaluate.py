@@ -1,3 +1,4 @@
+import argparse
 import time
 import json
 import tqdm
@@ -11,11 +12,12 @@ from botocore.config import Config
 from openai import OpenAI, NotGiven
 
 from enum import Enum
-from typing import Dict, Any, Union, List, Tuple, Callable
+from typing import Any, Union, Callable, Optional
+from pathlib import Path
 from langchain_aws.chat_models.bedrock_converse import ChatBedrockConverse
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.messages import AIMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 from dotenv import load_dotenv
 import pandas as pd
@@ -23,6 +25,7 @@ import concurrent.futures
 from threading import Lock
 from datetime import datetime
 import requests
+import yaml
 
 load_dotenv()
 
@@ -47,6 +50,13 @@ JSON_ENFORCE = (
 )
 
 
+DEFAULT_VERIFIER_PROMPT = (
+    "Expected answer: {expected}\n"
+    "Candidate answer: {candidate}\n"
+    "Are these two answers referring to the same entity? Answer with true or false."
+)
+
+
 class Provider(str, Enum):
     OPENAI = "openai"
     BEDROCK = "bedrock"
@@ -65,6 +75,8 @@ class ModelRegistry:
             # "o1",
             "o1-mini",
             "o3-mini",
+            "gpt-5-mini",
+            "gpt-5",
         ],
         Provider.BEDROCK: [
             "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -91,7 +103,7 @@ class ModelRegistry:
     def __init__(self):
         self.completed_benchmarks = set()
 
-    def get_models_for_provider(self, provider: Provider) -> List[str]:
+    def get_models_for_provider(self, provider: Provider) -> list[str]:
         """Get all models supported by a specific provider."""
         return self.PROVIDER_MODELS.get(provider, [])
 
@@ -99,7 +111,7 @@ class ModelRegistry:
         """Check if a model is valid for a given provider."""
         return model in self.PROVIDER_MODELS.get(provider, [])
 
-    def get_all_provider_model_combinations(self) -> List[Tuple[Provider, str]]:
+    def get_all_provider_model_combinations(self) -> list[tuple[Provider, str]]:
         """Get all valid provider-model combinations."""
         combinations = []
         for provider in Provider:
@@ -112,30 +124,156 @@ class ModelRegistry:
         self.completed_benchmarks.add((provider, model))
 
 
+class ModelSpec(BaseModel):
+    provider: Provider
+    model: str
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _validate_provider(cls, value: Union[Provider, str]) -> Provider:
+        if isinstance(value, Provider):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            try:
+                return Provider(normalized)
+            except ValueError as exc:
+                raise ValueError(f"Unsupported provider '{value}'.") from exc
+        raise TypeError("Provider must be provided as a string or Provider enum.")
+
+    @model_validator(mode="after")
+    def _validate_model(self) -> "ModelSpec":
+        registry = ModelRegistry()
+        if not registry.is_valid_model(self.provider, self.model):
+            raise ValueError(
+                f"Model '{self.model}' is not registered for provider '{self.provider.value}'."
+            )
+        return self
+
+
+class EvaluationConfig(BaseModel):
+    responses_folder: str
+    results_summary: str
+    records_path: str
+    verifier_prompt: str
+    models: list[ModelSpec]
+    verifier_model: ModelSpec
+    num_workers: int = 4
+    bedrock_cooldown: float = 0.5
+
+    @model_validator(mode="before")
+    @classmethod
+    def _preprocess(cls, data: dict[str, Any]) -> dict[str, Any]:
+        if data is None:
+            raise ValueError("Configuration data cannot be empty.")
+
+        processed = dict(data)
+        processed["models"] = cls._normalize_models(processed.get("models"))
+        processed["verifier_model"] = cls._normalize_model_spec(
+            processed.get("verifier_model")
+        )
+
+        return processed
+
+    @staticmethod
+    def _normalize_models(raw: Any) -> list[dict[str, str]]:
+        if raw is None:
+            raise ValueError("'models' must be provided.")
+
+        if isinstance(raw, str) and raw.strip().lower() == "all":
+            registry = ModelRegistry()
+            return [
+                {"provider": provider.value, "model": model}
+                for provider, model in registry.get_all_provider_model_combinations()
+            ]
+
+        if isinstance(raw, dict):
+            normalized: list[dict[str, str]] = []
+            for provider_name, models in raw.items():
+                if isinstance(models, str):
+                    model_names = [models]
+                elif isinstance(models, list):
+                    model_names = models
+                else:
+                    raise TypeError(
+                        "Model lists must be provided as strings or lists of strings."
+                    )
+
+                for model_name in model_names:
+                    normalized.append(
+                        {"provider": str(provider_name), "model": str(model_name)}
+                    )
+
+            if not normalized:
+                raise ValueError("At least one model must be specified under 'models'.")
+            return normalized
+
+        raise TypeError(
+            "'models' must be a mapping of provider to model names or the string 'all'."
+        )
+
+    @staticmethod
+    def _normalize_model_spec(raw: Any) -> dict[str, str]:
+        if raw is None:
+            raise ValueError("'verifier_model' must be provided.")
+
+        if isinstance(raw, ModelSpec):
+            return {"provider": raw.provider.value, "model": raw.model}
+
+        if isinstance(raw, dict):
+            provider = raw.get("provider")
+            model = raw.get("model")
+            if not provider or not model:
+                raise ValueError(
+                    "'verifier_model' must include both 'provider' and 'model' entries."
+                )
+            return {"provider": str(provider), "model": str(model)}
+
+        raise TypeError(
+            "'verifier_model' must be a mapping with 'provider' and 'model' keys."
+        )
+
+    @classmethod
+    def from_yaml(cls, path: Union[str, Path]) -> "EvaluationConfig":
+        config_path = Path(path)
+        with config_path.open("r") as f:
+            data = yaml.safe_load(f) or {}
+        return cls.model_validate(data)
+
+
 class StructuredLLM:
     def __init__(
         self,
-        provider: Union[Provider, str],
-        model_id: str,
-        output_format: BaseModel,
+        model: Union[ModelSpec, dict[str, Any]],
+        output_format: type[BaseModel],
         temperature: float = 0.2,
         max_completion_tokens: int = 8192,
     ):
-        self.provider = (
-            provider if isinstance(provider, Provider) else Provider(provider)
-        )
-        self.model_id = model_id
+        if isinstance(model, ModelSpec):
+            self.model_spec = model
+        elif isinstance(model, dict):
+            self.model_spec = ModelSpec(**model)
+        else:
+            raise TypeError(
+                "model must be provided as a ModelSpec or mapping with 'provider' and 'model'."
+            )
+
+        self.provider = self.model_spec.provider
+        self.model_id = self.model_spec.model
         self.output_format = output_format
         self.temperature = temperature
         self.max_completion_tokens = max_completion_tokens
         self.is_reasoning = False
         self.thinking_params = None
 
-        model_registry = ModelRegistry()
-        if not model_registry.is_valid_model(self.provider, self.model_id):
-            raise ValueError(
-                f"Model '{self.model_id}' is not supported by provider '{self.provider}'"
-            )
+        openai_reasoning_models = {
+            "o1",
+            "o1-preview",
+            "o1-mini",
+            "o3-mini",
+            "gpt-5",
+            "gpt-5-mini",
+        }
 
         if "reasoning" in self.model_id:
             self.model_id = self.model_id.replace("-reasoning", "")
@@ -151,19 +289,14 @@ class StructuredLLM:
             else:
                 self.temperature = 0.6
 
+        if self.provider == Provider.OPENAI and self.model_id in openai_reasoning_models:
+            self.temperature = NotGiven()
+
         if self.provider in [Provider.OPENAI, Provider.NVIDIA]:
             self.api_key = self._get_api_key()
         self.client = self._initialize_client()
         if self.provider == Provider.BEDROCK:
             self.bedrock_llm = self._get_bedrock_llm()
-
-        if self.provider == Provider.OPENAI and self.model_id in [
-            "o1",
-            "o1-preview",
-            "o1-mini",
-            "o3-mini",
-        ]:
-            self.temperature = NotGiven()
 
     def _get_api_key(self) -> str:
         """Get API key from environment variables based on the provider."""
@@ -228,8 +361,8 @@ class StructuredLLM:
         return parsed_output
 
     def _extract_from_content(
-        self, content: Union[str, List[AIMessage]]
-    ) -> Tuple[str, str]:
+        self, content: Union[str, list[AIMessage]]
+    ) -> tuple[str, str]:
         """Extract raw_response and reasoning from model response content."""
         raw_response, reason = None, None
         try:
@@ -273,7 +406,7 @@ class StructuredLLM:
         return raw_response, reason
 
     @staticmethod
-    def _parse_raw_reasoning_output(raw_output: str) -> Tuple[str, str]:
+    def _parse_raw_reasoning_output(raw_output: str) -> tuple[str, str]:
         """Parse the raw reasoning output from the AI model."""
         pattern = r"<think>\s*(.*?)\s*</think>\s*(.*)"
         match = re.search(pattern, raw_output, re.DOTALL)
@@ -303,7 +436,7 @@ class StructuredLLM:
         )
         return llm
 
-    def _call_bedrock(self, messages: list[dict]) -> Dict[str, Any]:
+    def _call_bedrock(self, messages: list[dict]) -> dict[str, Any]:
         """Call the Bedrock LLM model with the given message."""
         try:
             reason = None
@@ -346,7 +479,7 @@ class StructuredLLM:
                 "error": str(e),
             }
 
-    def _call_ollama(self, messages: str) -> Dict[str, Any]:
+    def _call_ollama(self, messages: str) -> dict[str, Any]:
         """Call the Ollama API with the given messages."""
         reason = None
         response = self.client.chat(
@@ -379,7 +512,7 @@ class StructuredLLM:
         }
         return output
 
-    def _call_openai(self, messages: str) -> Dict[str, Any]:
+    def _call_openai(self, messages: str) -> dict[str, Any]:
         """Call the OpenAI API with the given messages."""
         try:
             now = time.time()
@@ -425,7 +558,7 @@ class StructuredLLM:
                 "error": str(e),
             }
 
-    def _call_openrouter(self, messages: str) -> Dict[str, Any]:
+    def _call_openrouter(self, messages: str) -> dict[str, Any]:
         """Call the OpenRouter API with the given messages."""
         reason = None
         response_format = {
@@ -498,7 +631,7 @@ class StructuredLLM:
                         "error": str(e),
                     }
 
-    def _call_nvidia(self, messages: str) -> Dict[str, Any]:
+    def _call_nvidia(self, messages: str) -> dict[str, Any]:
         now = time.time()
         response = self.client.chat.completions.create(
             model=self.model_id,
@@ -542,7 +675,7 @@ class StructuredLLM:
                 fields[field_name] = None
         return self.output_format(**fields)
 
-    def __call__(self, prompt: str) -> Dict[str, Any]:
+    def __call__(self, prompt: str) -> dict[str, Any]:
         """Evaluate the given messages using the appropriate LLM model."""
         # TODO: Add support for dynamic example, instead of hardcoding
         json_schema = JSON_ENFORCE.format(
@@ -574,16 +707,16 @@ class Evaluate:
         qa_llm: StructuredLLM,
         records: list[dict],
         use_context: bool,
-        responses_save_path: str = None,
-        verifier_provider: Provider = Provider.OPENAI,
-        verifier_model: str = "gpt-4o",
+        verifier_model: ModelSpec,
+        responses_save_path: Optional[str] = None,
+        verifier_prompt: Optional[str] = None,
         num_workers: int = 4,
         bedrock_cooldown: float = 0.5,
     ):
         self.qa_llm = qa_llm
+        self.verifier_model = verifier_model
         self.verifier_llm = StructuredLLM(
-            provider=verifier_provider,
-            model_id=verifier_model,
+            model=self.verifier_model.model_copy(),
             output_format=AreSimilar,
         )
         self.records = records
@@ -591,27 +724,25 @@ class Evaluate:
         self.num_workers = num_workers
         self.bedrock_cooldown = bedrock_cooldown
         self.use_context = use_context
+        self.verifier_prompt = verifier_prompt or DEFAULT_VERIFIER_PROMPT
 
         self.file_lock = Lock()
 
         records_per_worker = len(records) / num_workers
         self.batch_size = max(1, math.ceil(records_per_worker))
 
-        self.qa_llm_params = {
-            "provider": qa_llm.provider,
-            "model_id": qa_llm.model_id,
+        self.qa_llm_config = {
+            "model": qa_llm.model_spec.model_copy(),
             "output_format": qa_llm.output_format,
             "temperature": qa_llm.temperature,
             "max_completion_tokens": qa_llm.max_completion_tokens,
         }
 
-        if qa_llm.is_reasoning:
-            self.qa_llm_params["model_id"] = f"{qa_llm.model_id}-reasoning"
-
-        self.verifier_llm_params = {
-            "provider": verifier_provider,
-            "model_id": verifier_model,
+        self.verifier_llm_config = {
+            "model": self.verifier_model.model_copy(),
             "output_format": AreSimilar,
+            "temperature": self.verifier_llm.temperature,
+            "max_completion_tokens": self.verifier_llm.max_completion_tokens,
         }
 
     def _save_result_to_jsonl(self, result: dict):
@@ -630,19 +761,26 @@ class Evaluate:
         if candidate.strip().lower() == expected.strip().lower():
             return True
         else:
-            VERIFY_PROMPT = (
-                f"Expected answer: {expected}\n"
-                f"Candidate answer: {candidate}\n"
-                "Are these two answers referring to the same entity? "
-                "Answer with true or false."
-            )
-            response = verifier_llm(VERIFY_PROMPT)
+            try:
+                prompt = self.verifier_prompt.format(
+                    expected=expected, candidate=candidate
+                )
+            except KeyError:
+                prompt = DEFAULT_VERIFIER_PROMPT.format(
+                    expected=expected, candidate=candidate
+                )
+            response = verifier_llm(prompt)
             return response["parsed_output"].are_the_same
 
     def _create_worker_llms(self):
         """Create new LLM instances for workers to avoid thread safety issues"""
-        qa_llm = StructuredLLM(**self.qa_llm_params)
-        verifier_llm = StructuredLLM(**self.verifier_llm_params)
+        qa_config = dict(self.qa_llm_config)
+        qa_config["model"] = qa_config["model"].model_copy()
+        qa_llm = StructuredLLM(**qa_config)
+
+        verifier_config = dict(self.verifier_llm_config)
+        verifier_config["model"] = verifier_config["model"].model_copy()
+        verifier_llm = StructuredLLM(**verifier_config)
         return qa_llm, verifier_llm
 
     def _process_record_without_context(self, record, worker_llms=None):
@@ -815,13 +953,21 @@ class BenchmarkRunner:
     def __init__(
         self,
         records: list[dict],
+        verifier_model: ModelSpec,
         responses_dir: str = "responses",
         results_file: str = "results.csv",
+        verifier_prompt: str = DEFAULT_VERIFIER_PROMPT,
+        num_workers: int = 4,
+        bedrock_cooldown: float = 0.5,
     ):
         self.records = records
         self.responses_dir = responses_dir
         self.results_file = results_file
         self.model_registry = ModelRegistry()
+        self.verifier_model = verifier_model
+        self.verifier_prompt = verifier_prompt or DEFAULT_VERIFIER_PROMPT
+        self.num_workers = num_workers
+        self.bedrock_cooldown = bedrock_cooldown
         os.makedirs(responses_dir, exist_ok=True)
 
         if not os.path.exists(results_file):
@@ -1006,11 +1152,11 @@ class BenchmarkRunner:
         else:
             new_df.to_csv(self.results_file, index=False)
 
-    def run_benchmark_for_model(self, provider: Provider, model: str):
+    def run_benchmark_for_model(self, model_spec: ModelSpec):
         """Run benchmark for a specific provider and model"""
-        model_filename = model.replace("/", "__")
+        model_filename = model_spec.model.replace("/", "__")
         responses_path = (
-            f"{self.responses_dir}/responses_{provider.value}_{model_filename}.jsonl"
+            f"{self.responses_dir}/responses_{model_spec.provider.value}_{model_filename}.jsonl"
         )
 
         try:
@@ -1020,13 +1166,17 @@ class BenchmarkRunner:
 
             if not records_no_context and not records_with_context:
                 print(
-                    f"All records already processed for {provider.value} model: {model}, skipping..."
+                    "All records already processed for "
+                    f"{model_spec.provider.value} model: {model_spec.model}, skipping..."
                 )
-                self._calculate_metrics_from_responses(responses_path, provider, model)
+                self._calculate_metrics_from_responses(
+                    responses_path, model_spec.provider, model_spec.model
+                )
                 return
 
             structured_llm = StructuredLLM(
-                provider=provider, model_id=model, output_format=Answer
+                model=model_spec.model_copy(),
+                output_format=Answer,
             )
 
             if records_no_context:
@@ -1036,6 +1186,10 @@ class BenchmarkRunner:
                     records=records_no_context,
                     responses_save_path=responses_path,
                     use_context=False,
+                    verifier_model=self.verifier_model,
+                    verifier_prompt=self.verifier_prompt,
+                    num_workers=self.num_workers,
+                    bedrock_cooldown=self.bedrock_cooldown,
                 )
                 evaluator.evaluate()
 
@@ -1046,37 +1200,61 @@ class BenchmarkRunner:
                     records=records_with_context,
                     responses_save_path=responses_path,
                     use_context=True,
+                    verifier_model=self.verifier_model,
+                    verifier_prompt=self.verifier_prompt,
+                    num_workers=self.num_workers,
+                    bedrock_cooldown=self.bedrock_cooldown,
                 )
                 evaluator.evaluate()
 
-            self._calculate_metrics_from_responses(responses_path, provider, model)
+            self._calculate_metrics_from_responses(
+                responses_path, model_spec.provider, model_spec.model
+            )
 
         except Exception as e:
-            print(f"Error evaluating {provider.value} model {model}: {e}")
+            print(
+                f"Error evaluating {model_spec.provider.value} model {model_spec.model}: {e}"
+            )
+
+    def run_selected_benchmarks(self, models: list[ModelSpec]):
+        """Run benchmarks for the specified provider-model combinations."""
+        for spec in models:
+            print(f"\nEvaluating {spec.provider.value} model: {spec.model}")
+            self.run_benchmark_for_model(spec)
 
     def run_all_benchmarks(self):
         """Run benchmarks for all provider-model combinations."""
-        for (
-            provider,
-            model,
-        ) in self.model_registry.get_all_provider_model_combinations():
-            print(f"\nEvaluating {provider.value} model: {model}")
-            self.run_benchmark_for_model(provider, model)
+        all_specs = [
+            ModelSpec(provider=provider, model=model)
+            for provider, model in self.model_registry.get_all_provider_model_combinations()
+        ]
+        self.run_selected_benchmarks(all_specs)
 
 
 if __name__ == "__main__":
-    RESPONSES_DIR = "responses"  # Directory to save intermediate responses
-    RESULT_PATH = "results.csv"  # Save the final results as a CSV file
-    RECORDS_PATH = "records.json"  # Input json, list of dictionaries with keys 'question', 'context', 'expected'
-    os.makedirs(RESPONSES_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Evaluate LLM benchmarks from YAML config.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to YAML configuration file.",
+    )
+    args = parser.parse_args()
 
-    records = read_json(RECORDS_PATH)
+    config = EvaluationConfig.from_yaml(args.config)
+
+    records = read_json(config.records_path)
 
     benchmark_runner = BenchmarkRunner(
-        records=records, responses_dir=RESPONSES_DIR, results_file=RESULT_PATH
+        records=records,
+        responses_dir=config.responses_folder,
+        results_file=config.results_summary,
+        verifier_model=config.verifier_model,
+        verifier_prompt=config.verifier_prompt,
+        num_workers=config.num_workers,
+        bedrock_cooldown=config.bedrock_cooldown,
     )
     now = datetime.now()
-    benchmark_runner.run_all_benchmarks()
+    benchmark_runner.run_selected_benchmarks(config.models)
     elapsed = datetime.now() - now
     elapsed_formatted = time.strftime("%H:%M:%S", time.gmtime(elapsed.total_seconds()))
     print(f"Completed benchmarking in {elapsed_formatted}")

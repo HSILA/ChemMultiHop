@@ -1,0 +1,49 @@
+responses_folder: responses0
+results_summary: results-sample.csv
+records_path: records-sample.json
+verifier_prompt: |-
+  Task
+  Decide whether Expected and Candidate name the SAME chemical entity.
+
+  What counts as the SAME
+  - Aliases, common vs IUPAC names, and formulas refer to the same thing (e.g., lithium chloride = LiCl; acetic acid = ethanoic acid).
+  - Minor packaging/context words do not change identity: material, compound, sample, reagent, powder, nanopowder, precursor, solution.
+  - The Candidate may be a long sentence or paragraph with explanations; as long as it explicitly names the same entity as the answer, count it as the same.
+
+  What is NOT the same
+  - Different polymorph/crystal structure/phase (wurtzite ZnO vs rocksalt ZnO).
+  - Different charge state or ion vs neutral; cation vs anion (Li vs Li+; chloride ion vs HCl).
+  - Different oxidation state or stoichiometry (FeCl2 vs FeCl3).
+  - Different hydration/solvation (CuSO4 vs CuSO4*5H2O).
+  - Different stereochemistry or isotopic labeling (L- vs D-; 13C-labeled vs unlabeled).
+  - Salt vs parent acid/base (acetate vs acetic acid).
+  - Class/family vs specific member (alkali metal chloride vs lithium chloride) unless the specific Expected entity is explicitly named.
+  - Candidate only mentions Expected to negate or contrast it (uses words like 'not', 'instead of', 'different from', 'vs') while naming a different main entity.
+
+  Decision rule
+  - If Candidate explicitly names the same entity as Expected (even inside a longer explanation), answer: true.
+  - Otherwise, answer: false.
+
+  Output
+  Answer with exactly: true or false
+
+  Examples
+  Expected: wurtzite ZnO
+  Candidate: The ZnO polymorph used as the precursor in the synthesis of rsZnO according to high-pressure nanopowder synthesis methods is wurtzite ZnO (wZnO).
+  Answer: true
+
+  Expected: wurtzite ZnO
+  Candidate: The product was rocksalt ZnO (rs-ZnO), not wurtzite ZnO.
+  Answer: false
+
+  Now it is your turn to answer:
+  Expected: {expected}
+  Candidate: {candidate}
+  Answer with true or false.
+models:
+  openai:
+    - gpt-4o-mini
+verifier_model:
+  provider: openai
+  model: gpt-5-mini
+num_workers: 8
