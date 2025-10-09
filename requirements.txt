@@ -3,6 +3,6 @@ tqdm
 openai
 python-dotenv
 pydantic
-langchain-aws
+langchain-aws==0.2.15
 boto3
 ollama
