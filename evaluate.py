@@ -60,7 +60,6 @@ DEFAULT_VERIFIER_PROMPT = (
 class Provider(str, Enum):
     OPENAI = "openai"
     BEDROCK = "bedrock"
-    NVIDIA = "nvidia"
     OLLAMA = "ollama"
     OPENROUTER = "openrouter"
 
@@ -94,9 +93,6 @@ class ModelRegistry:
             "google/gemma-3-27b-it",
             "deepseek/deepseek-r1-distill-qwen-32b-reasoning",
             "qwen/qwq-32b-reasoning",
-        ],
-        Provider.NVIDIA: [
-            # "deepseek-ai/deepseek-r1",
         ],
     }
 
@@ -292,7 +288,7 @@ class StructuredLLM:
         if self.provider == Provider.OPENAI and self.model_id in openai_reasoning_models:
             self.temperature = NotGiven()
 
-        if self.provider in [Provider.OPENAI, Provider.NVIDIA]:
+        if self.provider == Provider.OPENAI:
             self.api_key = self._get_api_key()
         self.client = self._initialize_client()
         if self.provider == Provider.BEDROCK:
@@ -302,7 +298,6 @@ class StructuredLLM:
         """Get API key from environment variables based on the provider."""
         key_mapping = {
             Provider.OPENAI: "OPENAI_API_KEY",
-            Provider.NVIDIA: "NVIDIA_API_KEY",
             Provider.OPENROUTER: "OPENROUTER_API_KEY",
         }
 
@@ -317,10 +312,6 @@ class StructuredLLM:
         """Initialize the appropriate client based on provider."""
         if self.provider == Provider.OPENAI:
             return OpenAI(api_key=self.api_key)
-        elif self.provider == Provider.NVIDIA:
-            return OpenAI(
-                base_url="https://integrate.api.nvidia.com/v1", api_key=self.api_key
-            )
         elif self.provider == Provider.BEDROCK:
             session = boto3.session.Session()
             configured_region = session.region_name
@@ -631,33 +622,6 @@ class StructuredLLM:
                         "error": str(e),
                     }
 
-    def _call_nvidia(self, messages: str) -> dict[str, Any]:
-        now = time.time()
-        response = self.client.chat.completions.create(
-            model=self.model_id,
-            messages=messages,
-            temperature=0.6,
-            top_p=0.7,
-            max_tokens=self.max_completion_tokens,
-        )
-        elapsed_ms = (time.time() - now) * 1000
-        response_text = response.choices[0].message.content
-
-        reason, raw_response = self._parse_raw_reasoning_output(response_text)
-
-        parsed_output = self._parse_json_from_text(raw_response)
-
-        output = {
-            "raw_response": raw_response,
-            "parsed_output": parsed_output,
-            "date": datetime.now(),
-            "latency": elapsed_ms,
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "reasoning": reason,
-        }
-        return output
-
     def _generate_empty_output(self):
         """Create an empty instance of the output format."""
         field_types = self.output_format.__annotations__
@@ -690,9 +654,6 @@ class StructuredLLM:
         elif self.provider == Provider.OPENAI:
             messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
             return self._call_openai(messages)
-        elif self.provider == Provider.NVIDIA:
-            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-            return self._call_nvidia(messages)
         elif self.provider == Provider.OLLAMA:
             messages = [{"role": "user", "content": prompt}]
             return self._call_ollama(messages)
